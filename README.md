@@ -1,2 +1,3 @@
-# rCore_learning
-rCore os learning scripts and notes.
+# Riscv-linux EXP
+Riscv_arch
+linux implements
