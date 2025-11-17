@@ -201,3 +201,104 @@ Hart 1 可能先执行 lw x2, flag0（看到 0），再执行 sw x4, flag1;
 
 #### 保留的程序次序
 
+![alt text](image-2.png)
+
+### C标准拓展（压缩）
+RVC 使用了一个简单的压缩策略，它提供常见 32 位 RISC-V 指令的较短的 16 位版本，当：
+1. 立即数或地址偏移量较小，或者
+2. 其中一个寄存器是零寄存器（x0）、ABI 链接寄存器（x1），或者 ABI 栈指针（x2），或者
+3. 目的寄存器和第一个源寄存器完全相同，或者
+4. 使用的寄存器是 8 个最流行的寄存器。
+
+C拓展允许16位的指令和32位的指令混合，其中32位指令可以从任何16位的边界开始。
+
+## Linux Riscv的迁移
+
+### Linux启动流程：
+
+![alt text](004da86a23534372976ddccaccc9df2a.png)
+
+1. 系统上电或者复位重启后，从ROM启动，将SPL加载到片上SRAM
+2. 引导spl运行：1、初始化ddr，2、加载opensbi（RUNTIME）和uboot（BOOTLOADER）到DDR
+3. 引导opensbi运行：1、基础硬件初始化 2、系统安全配置等
+4. 引导u-boot启动： 1、文件系统、网络、存储等配置 2、从存储（EMMC、DRAM等）中加载Linux（OS）到DDR
+5. 最后运行在RISCV core上的只有opensbi和Linux，而Linux可以通过sbi接口来调用opensbi
+
+首先理解一下这其中的术语和原因：
+```txt
+SPL:二级程序加载器，虽然叫 “二级”，但在很多系统中它实际上是 第一级可编程的 bootloader。
+
+片上 SRAM（On-Chip SRAM）：集成在 SoC 芯片内部的小容量静态 RAM（通常 64KB ~ 512KB）
+
+DDR：双倍数据速率同步动态随机存取存储器，传统的 SDRAM（Single Data Rate）在每个时钟周期的上升沿传输一次数据。DDR 内存在每个时钟周期的上升沿和下降沿都传输数据，数据传输速率是时钟频率的两倍。
+
+注意：DDR 不像 SRAM 那样上电就能用，它需要复杂的初始化序列。
+同时SRAM的太小，无法存放完整的bootloader和OS，所以需要先用SPL初始化DDR，然后再加载更大的程序到DDR中运行。
+```
+
+### opensbi简介
+OpenSBI（Open Source Supervisor Binary Interface）是一个开源的RISC-V特权软件实现，提供了RISC-V处理器与操作系统之间的接口。它实现了RISC-V的Supervisor Binary Interface（SBI），允许操作系统在特权模式下运行，并提供了一些基本的系统服务，如中断处理、定时器管理和内存管理等。
+
+![alt text](1083701-20240504072735683-584373319.png)
+
+#### 动机：
+OpenSBI的设计主要是为了提供一个标准化的接口，不同的厂商可能有不同的M-mode代码， 如果每个操作系统都要适配不同厂商的M-mode代码，那么工作量会非常大。OpenSBI作为一个中间层，提供了一个统一的接口，操作系统只需要适配OpenSBI，而不需要关心底层的M-mode实现。
+
+#### 三种用法：
+|模式|描述|对应二进制文件|
+|----|----|--------------|
+|fw_jump|仅提供SBI服务，跳转到外部payload(Uboot或Linux)|fw_jump.elf|
+|fw_payload|包含SBI服务和payload（Uboot或Linux）|fw_payload.elf|
+|fw_dynamic|SBI服务和payload分开加载|fw_dynamic.elf|
+
+因此需要重定位支持(rela_dyn_start)，PMP对齐。
+
+#### OpenSBI的链接脚本和启动汇编：
+从链接脚本里可以清晰地看到固件的地址规划和排布
+
+**fw_jump.elf.ldS**:
+```ld
+OUTPUT_ARCH(riscv)
+ENTRY(_start)
+
+SECTIONS
+{
+	#include "fw_base.ldS"
+
+	PROVIDE(_fw_reloc_end = .);
+}
+```
+
+**fw_base.ldS**:
+
+代码量较长，首先设置固件起始地址：
+```ld
+. = FW_TEXT_START;
+	/* Don't add any section between FW_TEXT_START and _fw_start */
+	PROVIDE(_fw_start = .);
+```
+接下来每一段都是以section的形式进行划分，对齐到4KB的页大小，便于内存管理。
+分为以下几部分：
+```ld
+    .text : { *(.text*) }           // 代码段
+    .rodata : { *(.rodata*) }       // 只读数据段
+    .dynsym : { *(.dynsym*) }       // 动态符号表
+    .rela.dyn : { *(.rela.dyn*) }   // 动态重定位表
+
+***在此之前是只读部分***
+    /*
+	 * PMP regions must be to be power-of-2. RX/RW will have separate
+	 * regions, so ensure that the split is power-of-2.
+	 */
+	. = ALIGN(1 << LOG2CEIL((SIZEOF(.rodata) + SIZEOF(.text)
+				+ SIZEOF(.dynsym) + SIZEOF(.rela.dyn))));
+***在此之后是rw部分***
+而上述代码的部分就是假设只读部分大小不是2的幂次方，那么通过ALIGN对齐到下一个2的幂次方地址，方便PMP（Physical Memory Protection，物理内存保护）进行权限划分。
+
+    .data : { *(.data*) }           // 数据段
+    .bss : { *(.bss*) }             // 未初始
+```
+### OpenSBI初始化：
+根据连接脚本fw_jump.elf.ldS，程序入口点为_start，从start开始：
+
+1. _start:选择用来boot的hart
