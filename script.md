@@ -201,7 +201,7 @@ Hart 1 可能先执行 lw x2, flag0（看到 0），再执行 sw x4, flag1;
 
 #### 保留的程序次序
 
-![alt text](image-2.png)
+![alt text](RVWMO.png)
 
 ### C标准拓展（压缩）
 RVC 使用了一个简单的压缩策略，它提供常见 32 位 RISC-V 指令的较短的 16 位版本，当：
@@ -218,11 +218,19 @@ C拓展允许16位的指令和32位的指令混合，其中32位指令可以从�
 
 ![alt text](004da86a23534372976ddccaccc9df2a.png)
 
-1. 系统上电或者复位重启后，从ROM启动，将SPL加载到片上SRAM
-2. 引导spl运行：1、初始化ddr，2、加载opensbi（RUNTIME）和uboot（BOOTLOADER）到DDR
-3. 引导opensbi运行：1、基础硬件初始化 2、系统安全配置等
-4. 引导u-boot启动： 1、文件系统、网络、存储等配置 2、从存储（EMMC、DRAM等）中加载Linux（OS）到DDR
-5. 最后运行在RISCV core上的只有opensbi和Linux，而Linux可以通过sbi接口来调用opensbi
+1. 系统上电或复位后，从 只读存储器（ROM，如 Mask ROM 或 Boot ROM）开始执行，加载 SPL（Secondary Program Loader）到 片上 SRAM（On-Chip SRAM）。
+2. SPL 运行阶段：
+- 初始化 DDR 内存控制器；
+- 将 OpenSBI（作为 M-mode 运行时固件）和 Bootloader（如 U-Boot）从存储介质（如 SPI-NOR、eMMC）加载到 DDR 中。
+3. OpenSBI 运行阶段：
+- 完成基础硬件初始化（如串口、中断控制器）；
+- 配置系统安全机制（如 PMP、PLIC）；
+- 提供标准 SBI 接口，为后续 Bootloader 或 OS 提供运行时服务。
+4. Bootloader（如 U-Boot）：
+- 初始化外设子系统（如存储、网络、文件系统）；
+- 从存储设备（如 eMMC、SD、NVMe、TFTP）加载 Linux 内核、设备树（DTB）和 initramfs；
+- 设置启动参数，并将控制权移交至 Linux 内核。到DDR
+- 最后运行在RISCV core上的只有opensbi和Linux，而Linux可以通过sbi接口来调用opensbi
 
 首先理解一下这其中的术语和原因：
 ```txt
@@ -299,6 +307,566 @@ SECTIONS
     .bss : { *(.bss*) }             // 未初始
 ```
 ### OpenSBI初始化：
+
+REF:https://github.com/riscv-software-src/opensbi/blob/master/docs/firmware/fw.md
+
+1. hartid via a0 register
+2. device tree blob address in memory via a1 register. The address must be aligned to 8 bytes
+
 根据连接脚本fw_jump.elf.ldS，程序入口点为_start，从start开始：
 
 1. _start:选择用来boot的hart
+```S
+_start:
+    /* 保存关键寄存器(a0-a2)到临时寄存器(s0-s2) */
+    MOV_3R  s0, a0, s1, a1, s2, a2  // s0=a0, s1=a1, s2=a2
+    /* 获取引导HART ID */
+    call    fw_boot_hart            // 调用函数获取引导HART ID
+    add     a6, a0, zero            // a6 = 返回值 (引导HART ID)
+    /* 恢复原始寄存器值 */
+    MOV_3R  a0, s0, a1, s1, a2, s2  // a0=s0, a1=s1, a2=s2
+    /* 检查是否指定了引导HART */
+    li      a7, -1                  // a7 = -1 (无效HART标志)
+    beq     a6, a7, _try_lottery    // 如果引导HART=-1，跳转到彩票机制
+    /* 当前HART不是引导HART则等待 */
+    bne     a0, a6, _wait_for_boot_hart  // 如果a0(当前HART)≠a6(引导HART)，跳转等待
+
+_try_lottery:
+    /* 使用原子操作竞争引导权限 */
+    lla     a6, _boot_lottery       // a6 = 彩票变量地址（通常为0）
+    li      a7, BOOT_LOTTERY_ACQUIRED  // a7 = 彩票获取值(通常=1)
+#ifdef __riscv_atomic
+	amoswap.w a6, a7, (a6)
+	bnez	a6, _wait_for_boot_hart
+#elif __riscv_zalrsc
+_sc_fail:
+	lr.w	t0, (a6)
+	sc.w	t1, a7, (a6)
+	bnez	t1, _sc_fail
+	bnez	t0, _wait_for_boot_hart
+#else
+#error "need a or zalrsc"
+#endif
+
+```
+2. _relocate: 由于程序链接的地址可能与bootloader实际加载的地址不一样，因此需要重定位。
+3. _relocate_done: 重定位完成后，进行基本的初始化工作，/* Reset all registers except ra, a0, a1, a2, a3 and a4 for boot HART */，设置堆栈指针、清除BSS段等。
+4. 调用fw_platform_init进行平台相关的初始化工作，比如设置时钟、中断控制器等。
+5. 先为多个hart预留一定的堆空间，由于堆是从底向上增长的，因此每个hart的堆空间是从高地址向低地址分配的。每个hart负责初始化scratch
+```txt
+为什么需要scratch？
+RISC-V SBI 标准明确规定每个 HART 必须有一个 struct sbi_scratch， 参考sbi_scratch.h
+由于RISCV系统支持多核，每个Hart独立运行，SBI需要在不依赖调度器的情况下为每个HART保存相关参数。
+```
+6. FDT重定位：核心功能是根据编译时的配置参数，计算并返回FDT的地址，供下一阶段（如 U-Boot 或 Linux 内核）使用
+
+7. sbi_init:
+初始化当前HART的sbi库，接收struct sbi_scratch参数(之前存放在堆里面，每个hart独立，现在加载CSR_MSCRATCH)，设置栈指针和中断处理。
+```txt
+在sbi_init中lib/sbi/sbi_init.c
+启动模式判断：根据next_mode字段（M/S/U模式）验证当前HART是否支持目标特权模式。
+冷启动（Coldboot）与热启动（Warmboot）选择：
+随机选择一个满足条件的HART执行完全初始化（Coldboot）。
+其余HART执行部分初始化（Warmboot），跳过重复配置
+平台相关初始化：调用平台回调函数（如sbi_platform_early_init），完成硬件特定配置（时钟、中断、串口等）。
+关键组件初始化：
+中断代理（SSIP/STIP/SEIP、异常代理）。
+控制台（sbi_console_init）。
+PMU、TLB、定时器（sbi_pmu_init/sbi_tlb_init/sbi_timer_init）等。
+跳转至下一阶段：根据next_addr和next_mode，将控制权移交下一引导阶段（如U-Boot/Linux）。
+```
+SBI提供的中断异常服务将在linux中的具体调用中提到。
+
+### Linux初始化过程
+首先查看链接脚本/riscv/kernel/vmlinux.Ids.S，其中提到了首先执行的部分为ENTRY(_start)。
+我们从_start开始分析(_start位于head.S)：
+```S
+SYM_CODE_START(_start)
+    /*
+     * Image header expected by Linux boot-loaders. The image header data
+     * structure is described in asm/image.h.
+     * Do not modify it without modifying the structure and all bootloaders
+     * that expects this header format!!
+     */
+    j _start_kernel
+    .word 0
+    .balign 8
+    /* ... image header fields ... */
+SYM_CODE_END(_start)
+```
+这段嵌入了一个标准化的Image Header，供 bootloader 识别镜像格式、加载偏移、魔数等关键元信息。
+紧接着跳转到_start_kernel(这里是内核真正初始化的地方):
+```S
+_start_kernel:
+SYM_CODE_START(_start_kernel)
+	/* Mask all interrupts */
+	csrw CSR_IE, zero
+	csrw CSR_IP, zero  //首先设置中断屏蔽，防止在初始化过程中被打断
+#ifdef CONFIG_RISCV_M_MODE
+    fence.i
+    call reset_regs
+    la a0, .Lpmp_done   
+	csrw CSR_TVEC, a0   //如果内核直接运行在M模式下(无内核)尝试设置PMP, 如果不支持PMP，那么这段代码可以保证能够直接跳转到PMP结束，避免异常。
+
+	li a0, -1
+	csrw CSR_PMPADDR0, a0
+	li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+	csrw CSR_PMPCFG0, a0
+```
+下一步加载全局指针global_pointer
+
+随后多核协调启动(CONFIG_RISCV_BOOT_SPINWAIT)：在这里面，首先通过lottery机制选择一个引导核(hart)，其他核则进入等待状态，直到引导核完成初始化并发出启动信号
+```txt
+剩余的将由主CPU通过SBI_IPI启动，执行secondary_start_sbi, 初始化自己的栈，页表，trap，调用smp_callin加入调度系统。
+```
+
+下一步清理BSS段，初始化栈，建立临时页表(CONFIG_MMU):1:1映射
+
+设置异常向量:
+```S
+    la a0, handle_exception
+    csrw CSR_TVEC, a0
+```
+跳转到C语言主干：
+```S
+tail start_kernel     // 永久跳转到 init/main.c:start_kernel()
+```
+在C语言主干(/init/main.c)中，
+1. 首先进行早期初始化工作：
+```c
+set_task_stack_end_magic(&init_task);  // 标记 init 进程栈边界（用于栈溢出检测）
+smp_setup_processor_id();              // 设置当前 CPU ID（对 SMP 至关重要）
+debug_objects_early_init();            // 调试对象跟踪
+cgroup_init_early();                   // cgroup 早期初始化
+local_irq_disable();                   // 确保中断关闭
+```
+2. 架构相关初始化：
+```c
+setup_arch(&command_line);
+```
+
+3. 子系统依赖初始化：
+
+| 阶段           | 函数                                                                 | 作用                                              |
+|----------------|----------------------------------------------------------------------|---------------------------------------------------|
+| 内存管理       | `mm_core_init()`                                                     | 初始化页分配器、slab 前身                         |
+| 中断系统       | `early_irq_init()` → `init_IRQ()`                                    | 初始化中断描述符、控制器(如 PLIC)                 |
+| 调度器         | `sched_init()`                                                       | 初始化 runqueue、idle 进程,但尚不能调度           |
+| RCU            | `rcu_init()`                                                         | 初始化 RCU 机制(无锁同步核心)                     |
+| 时间系统       | `timekeeping_init()`、`time_init()`                                  | 初始化时钟源、jiffies、高精度定时器               |
+| 随机数         | `random_init_early()` → `random_init()`                              | 初始化熵池(用于 ASLR、加密等)                     |
+| 安全机制       | `security_init()`                                                    | LSM(如 SELinux)初始化                             |
+| 文件系统       | `vfs_caches_init()`                                                  | 初始化 dentry/inode 缓存                          |
+| 进程/命名空间  | `pid_idr_init()`、`uts_ns_init()`、`net_ns_init()`                   | 初始化 PID 管理、UTS/network 命名空间             |
+| 控制台         | `console_init()`                                                     | 启用串口/帧缓冲控制台输出(内核日志从此开始)       |
+
+4. 后期初始化和用户空间启动：
+
+| 阶段           | 函数/流程                                    | 作用                                              |
+|----------------|----------------------------------------------|---------------------------------------------------|
+| 内核线程启动   | `rest_init()` → `kernel_init()`              | 启动 init 进程(PID=1)，准备进入用户空间          |
+| 驱动初始化     | `do_initcalls()`                             | 按优先级调用所有模块的 `__init` 函数             |
+| 根文件系统挂载 | `prepare_namespace()` → `mount_root()`       | 挂载 rootfs(initramfs 或磁盘根分区)               |
+| 用户空间切换   | `run_init_process("/sbin/init")`             | 执行 init 程序(systemd/busybox)，内核态→用户态   |
+| 多核启动完成   | `smp_init()` → 其他核执行 `cpu_startup_entry()`| 所有 CPU 进入 idle 循环，等待调度                 |
+
+5. 系统进入稳定运行状态：
+- init 进程启动系统服务(如 udev、网络、登录管理器等)
+- 内核进入事件驱动模式：中断处理 + 系统调用服务
+
+### Linux 中断/异常处理流程
+
+#### 异常处理入口
+在 `head.S` 中设置的 `handle_exception` 是所有 trap 的统一入口：
+
+```S
+handle_exception:
+    // 保存上下文到栈
+    csrr t0, CSR_CAUSE       // 读取异常原因
+    blt t0, zero, handle_interrupt  // CAUSE 最高位为1表示中断
+    // 否则是同步异常(系统调用/缺页等)
+    call do_trap_<type>      // 根据 CAUSE 值调用具体处理函数
+```
+```
+用户态 ecall → trap 到 S-mode → handle_exception 
+→ do_trap_ecall_u() → syscall() → sys_xxx()
+→ 返回用户态
+
+这一点rCore和LINUX是一致的。
+```
+#### SBI 调用示例:
+```c
+// arch/riscv/kernel/sbi.c
+long sbi_set_timer(uint64_t stime_value) {
+    struct sbiret ret;
+    ret = sbi_ecall(SBI_EXT_TIME, SBI_EXT_TIME_SET_TIMER, 
+                    stime_value, 0, 0, 0, 0, 0);
+    return ret.error;
+}
+```
+
+#### SV39分页机制
+
+![alt text](satp.png)
+上图为**satp**字段分布，我们可以把它当作一个**64位的usize**，当 MODE 设置为 0 的时候，所有访存都被视为物理地址；而设置为 8 时，SV39 分页机制被启用，所有 S/U 特权级的访存被视为一个 39 位的虚拟地址，MMU 会将其转换成 56 位的物理地址；如果转换失败，则会触发异常。
+![alt text](sv39-va-pa.png)![alt text](sv39-va-pa-1.png)
+
+上图分别为虚拟地址和物理地址，两个之间如何进行转换？`VPN => (MMU) => PPN`
+下面的图更清楚一点，**vpn被分为了三段，每段长9位，pte为页表项，一个页表中有512个页表项，那么我们就可以知道vpn对应的pte，由pte知道下一级的ppn在哪里，以此类推最终加上offset就是对应的最终的PhysicalAddr**
+![alt text](MMU.png)
+**这些数字到底是如何确定的？**
+
+假如说我们现在需要设计一个**64位**计算机，所以我们的地址是64位也就是**8个字节**来控制我们的计算机。现在我们想要采用分页机制来管理我们的内存。
+在这个基础上，我们规定每页的大小是**4096B**,这样的话我们每页就能容纳**512行**东西，而我们又想设计多级页表，这样需要很少的位数就能管理很多的页表了，所以512行东西我们规定东西就是页表项，那就是`2^9`，在此基础上我们假设有三级页表，那么我们需要的就是`9+9+9=27`位来管理`2^27`个页表，大小总共`2^39 B`,这就是为什么这个机制称为**SV39机制**。这也是我们虚拟地址是39位的原因。
+
+```txt
+linux中有关这部分的实现在
+/arch/riscv/include/asm/pgtable-64.h
+/arch/riscv/include/asm/pgtable-bits.h
+/arch/riscv/include/asm/pgtable.h
+/arch/riscv/include/asm/pgtable.c
+```
+
+
+### QEMU + BusyBox + Linux 调试指南
+
+#### 1. 编译准备
+
+##### 编译支持调试的 Linux 内核
+```bash
+cd linux
+make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- menuconfig
+
+# 启用以下调试选项:
+# Kernel hacking --->
+#   [*] Kernel debugging
+#   [*] Compile-time checks and compiler options --->
+#       [*] Compile the kernel with debug info
+#       [*] Provide GDB scripts for kernel debugging
+#   [*] KGDB: kernel debugger
+#   [*] Debug kernel data structures
+#   [*] Memory Debugging --->
+#       [*] Detect stack corruption on calls to schedule()
+
+# 编译内核
+make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc)
+```
+
+##### 编译 OpenSBI (带调试信息)
+```bash
+cd opensbi
+make PLATFORM=generic FW_PAYLOAD_PATH=../linux/arch/riscv/boot/Image DEBUG=1
+```
+
+---
+
+#### 2. QEMU 启动参数
+
+##### 基本调试模式
+```bash
+qemu-system-riscv64 \
+    -M virt \
+    -m 2G \
+    -smp 4 \
+    -kernel opensbi/build/platform/generic/firmware/fw_payload.elf \
+    -drive file=rootfs.ext4,format=raw,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -append "root=/dev/vda rw console=ttyS0 earlycon=sbi" \
+    -nographic \
+    -s -S  # -s: 监听 1234 端口, -S: 启动时暂停
+```
+
+##### 详细日志模式
+```bash
+qemu-system-riscv64 \
+    -M virt \
+    -m 2G \
+    -kernel opensbi/build/platform/generic/firmware/fw_payload.elf \
+    -append "console=ttyS0 earlycon debug loglevel=8 initcall_debug" \
+    -nographic \
+    -d int,cpu_reset,guest_errors \  # QEMU 调试输出
+    -D qemu.log                       # 日志文件
+```
+
+##### 串口调试
+```bash
+# 将串口输出重定向到文件
+qemu-system-riscv64 \
+    -M virt \
+    -serial file:serial.log \
+    # ...其他参数...
+```
+
+---
+
+#### 3. GDB 调试
+
+##### 启动 GDB 并连接 QEMU
+```bash
+# 终端 1: 启动 QEMU (带 -s -S)
+qemu-system-riscv64 -M virt -kernel fw_payload.elf -s -S -nographic
+
+# 终端 2: 启动 GDB
+riscv64-linux-gnu-gdb vmlinux
+(gdb) target remote :1234
+(gdb) break start_kernel    # 在 start_kernel 设置断点
+(gdb) continue
+```
+
+##### 常用 GDB 命令
+```gdb
+# 查看寄存器
+info registers
+info registers all
+
+# 查看 CSR 寄存器(需要 QEMU monitor)
+monitor info registers
+
+# 查看内存
+x/10x 0x80000000          # 查看物理地址
+x/10i $pc                  # 查看当前指令
+
+# 查看页表
+(gdb) p/x *((unsigned long *)0xffffffff80000000)@512  # 打印页表项
+
+# 查看调用栈
+backtrace
+bt full
+
+# 单步执行
+stepi                      # 单步一条汇编指令
+nexti                      # 单步(跳过函数调用)
+step                       # 单步一行 C 代码
+next                       # 单步(跳过函数)
+
+# 断点管理
+break *0x80000000          # 在地址设置断点
+break do_trap_ecall_u      # 在函数设置断点
+info breakpoints
+delete 1                   # 删除断点 1
+
+# 观察点
+watch *(int *)0x80200000   # 当内存变化时中断
+```
+
+##### 使用 Linux 内核 GDB 脚本
+```bash
+# 在 Linux 源码目录下启动 GDB
+cd linux
+gdb vmlinux
+(gdb) source scripts/gdb/vmlinux-gdb.py
+
+# 可用命令:
+(gdb) lx-dmesg              # 查看内核日志缓冲区
+(gdb) lx-symbols            # 加载模块符号
+(gdb) lx-ps                 # 查看进程列表
+(gdb) lx-cmdline            # 查看内核启动参数
+```
+
+---
+
+#### 4. QEMU Monitor 调试
+
+##### 进入 Monitor 模式
+```bash
+# 在 QEMU 串口界面按 Ctrl-A C 进入 monitor
+(qemu) info registers       # 查看所有寄存器
+(qemu) info mem             # 查看内存映射
+(qemu) info mtree           # 查看内存树
+(qemu) info tlb             # 查看 TLB 状态
+(qemu) x/10i $pc            # 查看当前 PC 指令
+(qemu) gpa2hva 0x80000000   # 虚拟地址转主机地址
+```
+
+##### 监控中断和异常
+```bash
+qemu-system-riscv64 \
+    -d int,in_asm,cpu \     # 打印中断、汇编、CPU 状态
+    -D debug.log \
+    # ...其他参数...
+
+# 过滤特定事件
+-d int                      # 只打印中断
+-d guest_errors             # 只打印客户机错误
+```
+
+---
+
+#### 5. 内核调试技巧
+
+##### 使用 printk 调试
+```c
+// arch/riscv/kernel/setup.c
+void __init setup_arch(char **cmdline_p) {
+    pr_info("=== DEBUG: Entering setup_arch ===\n");
+    pr_info("Hart ID: %ld\n", cpuid_to_hartid_map(0));
+    
+    // 打印设备树信息
+    pr_info("FDT at: 0x%lx\n", dtb_early_pa);
+    
+    // ...existing code...
+}
+```
+
+##### 早期串口输出 (earlycon)
+```bash
+# 内核启动参数
+earlycon=sbi                # 使用 SBI 输出
+earlycon=uart8250,mmio,0x10000000  # 直接使用 UART
+```
+
+##### 使用 ftrace 追踪函数调用
+```bash
+# 挂载 debugfs
+mount -t debugfs none /sys/kernel/debug
+
+# 启用函数追踪
+echo function > /sys/kernel/debug/tracing/current_tracer
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+
+# 查看追踪结果
+cat /sys/kernel/debug/tracing/trace
+
+# 追踪特定函数
+echo sys_write > /sys/kernel/debug/tracing/set_ftrace_filter
+```
+
+---
+
+#### 6. OpenSBI 调试
+
+##### 编译带日志的 OpenSBI
+```bash
+make PLATFORM=generic \
+     FW_PAYLOAD_PATH=../linux/arch/riscv/boot/Image \
+     DEBUG=1 \
+     LOG_LEVEL=3  # 0=紧急, 1=错误, 2=警告, 3=信息, 4=调试
+```
+
+##### 在 OpenSBI 中添加调试输出
+```c
+// lib/sbi/sbi_init.c
+void __noreturn sbi_init(struct sbi_scratch *scratch) {
+    sbi_printf("=== DEBUG: Entering sbi_init ===\n");
+    sbi_printf("HART ID: %u\n", current_hartid());
+    sbi_printf("Scratch addr: 0x%lx\n", (unsigned long)scratch);
+    
+    // ...existing code...
+}
+```
+
+---
+
+#### 7. 常见调试场景
+
+##### 场景 1: 调试启动卡住
+```bash
+# 使用 QEMU 的 -d 选项查看最后执行的指令
+qemu-system-riscv64 -d in_asm,int -D boot.log ...
+
+# 在可能卡住的地方设置断点
+(gdb) break setup_arch
+(gdb) break start_kernel
+(gdb) break rest_init
+```
+
+##### 场景 2: 调试页表问题
+```gdb
+# 查看 SATP 寄存器
+(qemu) info registers satp
+
+# 手动遍历页表
+(gdb) p/x *((unsigned long *)0xffffffff80000000)  # 一级页表
+(gdb) # 根据 PTE 计算二级页表地址并继续查看
+```
+
+##### 场景 3: 调试系统调用
+```c
+// arch/riscv/kernel/syscall.c
+asmlinkage long syscall(struct pt_regs *regs) {
+    printk("=== SYSCALL: nr=%ld, a0=0x%lx ===\n", 
+           regs->a7, regs->a0);
+    // ...existing code...
+}
+```
+
+##### 场景 4: 调试中断处理
+```c
+// arch/riscv/kernel/irq.c
+void do_IRQ(struct pt_regs *regs) {
+    unsigned long cause = regs->cause;
+    printk("=== IRQ: cause=0x%lx, epc=0x%lx ===\n", 
+           cause, regs->epc);
+    // ...existing code...
+}
+```
+
+---
+
+#### 8. 性能分析
+
+##### 使用 perf 工具
+```bash
+# 在 Linux 内核配置中启用
+CONFIG_PERF_EVENTS=y
+
+# 编译 perf 工具
+cd linux/tools/perf
+make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu-
+
+# 在目标系统上使用
+perf stat ./your_program         # 统计性能事件
+perf record -e cycles ./your_program  # 记录性能数据
+perf report                       # 查看报告
+```
+
+##### 查看系统状态
+```bash
+cat /proc/interrupts              # 查看中断统计
+cat /proc/meminfo                 # 查看内存信息
+cat /proc/cpuinfo                 # 查看 CPU 信息
+cat /sys/kernel/debug/tracing/trace  # 查看追踪日志
+```
+
+---
+
+#### 9. 常见问题排查
+
+| 问题现象 | 可能原因 | 排查方法 |
+|---------|---------|---------|
+| 启动时立即重启 | OpenSBI 跳转地址错误 | 检查 `fw_payload.elf` 是否正确链接 |
+| 卡在 "Booting Linux" | 设备树问题 | 使用 `-d guest_errors` 查看错误 |
+| 用户态程序无法运行 | 根文件系统问题 | 检查 `root=` 参数和文件系统格式 |
+| 页错误循环 | 页表配置错误 | 使用 GDB 检查页表项 `PTE_V/PTE_R/PTE_W` |
+| 中断无响应 | PLIC 未初始化 | 检查设备树中的 PLIC 节点 |
+
+---
+
+#### 10. 调试技巧总结
+
+```bash
+# 完整的调试启动命令示例
+qemu-system-riscv64 \
+    -M virt -m 2G -smp 4 \
+    -kernel fw_payload.elf \
+    -drive file=rootfs.ext4,format=raw,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -append "root=/dev/vda rw console=ttyS0 earlycon=sbi debug loglevel=8" \
+    -nographic \
+    -s -S \
+    -d int,guest_errors,cpu_reset \
+    -D qemu_debug.log
+
+# 在另一个终端启动 GDB
+riscv64-linux-gnu-gdb vmlinux \
+    -ex 'target remote :1234' \
+    -ex 'break start_kernel' \
+    -ex 'continue'
+```
+
+**调试流程建议:**
+1. 先用 QEMU `-d` 选项确定问题大致位置
+2. 使用 GDB 在关键函数设置断点
+3. 结合 `printk` 和 `earlycon` 输出详细信息
+4. 使用 QEMU monitor 查看硬件状态
+5. 必要时查看设备树和内存布局
