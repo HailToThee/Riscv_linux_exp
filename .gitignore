@@ -1,9 +1,17 @@
-# Ignore external projects / build dependencies
-busybox/
-linux/
-qemu/
-riscv-gnu-toolchain/
-rootfs.img
+# Build artifacts
+*.img
 *.bin
 *.elf
+rootfs.img
 build/
+
+# Subprojects (treat as external dependencies)
+opensbi/
+linux/
+busybox/
+qemu/
+riscv-gnu-toolchain/
+
+# Logs and temp files
+*.log
+.DS_Store
