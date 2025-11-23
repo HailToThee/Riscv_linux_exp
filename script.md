@@ -215,6 +215,12 @@ C拓展允许16位的指令和32位的指令混合，其中32位指令可以从�
 ## Linux Riscv的迁移
 
 ### Linux启动流程：
+```
+启动参数：
+使用了qemu模拟器，同时使用busybox提供小型的rootfs文件系统，以及支持一个很小的shell环境。
+```bash
+qemu-system-riscv64   -nographic   -machine virt   -cpu rv64   -m 256M   -bios opensbi/build/platform/generic/firmware/fw_jump.elf   -kernel linux/arch/riscv/boot/Image   -drive file=rootfs.img,if=virtio,format=raw   -append "root=/dev/vda rw console=ttyS0 earlycon=sbi"   -S -s
+```
 
 ![alt text](004da86a23534372976ddccaccc9df2a.png)
 
@@ -244,7 +250,13 @@ DDR：双倍数据速率同步动态随机存取存储器，传统的 SDRAM（Si
 同时SRAM的太小，无法存放完整的bootloader和OS，所以需要先用SPL初始化DDR，然后再加载更大的程序到DDR中运行。
 ```
 
-### opensbi简介
+```txt
+本实验中，情况略有不同，由于是直接使用QEMU模拟器启动，则跳过了ROM和SPL阶段，直接从OpenSBI开始执行(-bios fw_jump.elf)。
+
+同时，由于不需要高级的初始化功能，OpenSBI后续直接启动Linux内核(-kernel linux)，而没有经过Bootloader阶段。
+```
+
+### OpenSBI简介
 OpenSBI（Open Source Supervisor Binary Interface）是一个开源的RISC-V特权软件实现，提供了RISC-V处理器与操作系统之间的接口。它实现了RISC-V的Supervisor Binary Interface（SBI），允许操作系统在特权模式下运行，并提供了一些基本的系统服务，如中断处理、定时器管理和内存管理等。
 
 ![alt text](1083701-20240504072735683-584373319.png)
@@ -432,47 +444,99 @@ SYM_CODE_START(_start_kernel)
 tail start_kernel     // 永久跳转到 init/main.c:start_kernel()
 ```
 在C语言主干(/init/main.c)中，
-1. 首先进行早期初始化工作：
+
+**1.最早期准备**
+
+在进入 start_kernel 初期，仍有一小段代码在显式禁用中断之前运行，用于建立最基本的执行环境，例如栈边界标记、CPU ID、早期调试设施与 cgroup 的早期初始化。
+
 ```c
-set_task_stack_end_magic(&init_task);  // 标记 init 进程栈边界（用于栈溢出检测）
-smp_setup_processor_id();              // 设置当前 CPU ID（对 SMP 至关重要）
-debug_objects_early_init();            // 调试对象跟踪
-cgroup_init_early();                   // cgroup 早期初始化
-local_irq_disable();                   // 确保中断关闭
+set_task_stack_end_magic(&init_task);  // 标记 init（0号）进程栈边界，用于检测栈溢出
+smp_setup_processor_id();              // 设置/获取当前引导 CPU 的逻辑 ID
+debug_objects_early_init();            // 初始化调试对象跟踪（early）
+cgroup_init_early();                   // cgroup 的早期初始化
 ```
-2. 架构相关初始化：
+
+**2.锁定环境与架构初始化（中断已禁用）**
+
+内核通常在此处显式禁用本地中断以防并发干扰，随后进行架构相关的早期初始化（如解析设备树、设定物理内存布局等）。
+
 ```c
-setup_arch(&command_line);
+local_irq_disable();           // 关中断，进入原子初始化阶段
+early_boot_irqs_disabled = true;
+boot_cpu_init();               // 标记并初始化引导 CPU
+pr_notice("%s", linux_banner); // 打印内核 banner（版本信息）
+setup_arch(&command_line);     // 架构相关的早期初始化（DTB/内存/命令行等）
+```
+```txt
+setup_arch() 的职责范围很广：解析 DTB/ACPI、发现内存边界、设置早期页表（如需要）以及处理早期命令行参数（例如 earlycon、mem= 等）
+```
+**3.核心子系统按顺序初始化（中断仍禁用）**
+
+在中断仍然被禁止的情况下，内核按严格顺序初始化基础子系统，顺序十分重要，因为后续子系统依赖先前建立的环境。
+
+按顺序完成：
+|顺序| 关键函数 | 作用 |
+|----|----------|------|
+|1 | mm_core_init() | 内存管理核心（页分配器等）初始化|
+|2 | sched_init() | 调度器初始化，建立runqueue，创立idle线程|
+|3 | workqueue_init_early() | 工作队列子系统初始化，允许创建早期工作项|
+|4 | rcu_init() | RCU(无锁同步机制)初始化|
+|5 | early_irq_init() -> init_IRQ() | 中断子系统初始化，设置中断控制器与向量表|
+|6 | timekeeping_init() -> time_init() | 时间子系统：clocksource，jiffies，高精度定时器等| 
+
+注：此阶段虽然中断控制器被配置，但本地 CPU 中断仍通常处于禁用状态，时钟中断不会立即触发。
+
+
+**4.启用中断与控制台输出**
+
+```c
+local_irq_enable(); // 允许本地中断，时钟中断与调度事件开始生效
+console_init();     // 初始化 console，prink/log 输出可见
 ```
 
-3. 子系统依赖初始化：
+**5.后期初始化（中断已启用，可进行阻塞操作）**
 
-| 阶段           | 函数                                                                 | 作用                                              |
-|----------------|----------------------------------------------------------------------|---------------------------------------------------|
-| 内存管理       | `mm_core_init()`                                                     | 初始化页分配器、slab 前身                         |
-| 中断系统       | `early_irq_init()` → `init_IRQ()`                                    | 初始化中断描述符、控制器(如 PLIC)                 |
-| 调度器         | `sched_init()`                                                       | 初始化 runqueue、idle 进程,但尚不能调度           |
-| RCU            | `rcu_init()`                                                         | 初始化 RCU 机制(无锁同步核心)                     |
-| 时间系统       | `timekeeping_init()`、`time_init()`                                  | 初始化时钟源、jiffies、高精度定时器               |
-| 随机数         | `random_init_early()` → `random_init()`                              | 初始化熵池(用于 ASLR、加密等)                     |
-| 安全机制       | `security_init()`                                                    | LSM(如 SELinux)初始化                             |
-| 文件系统       | `vfs_caches_init()`                                                  | 初始化 dentry/inode 缓存                          |
-| 进程/命名空间  | `pid_idr_init()`、`uts_ns_init()`、`net_ns_init()`                   | 初始化 PID 管理、UTS/network 命名空间             |
-| 控制台         | `console_init()`                                                     | 启用串口/帧缓冲控制台输出(内核日志从此开始)       |
+打开中断和控制台后，内核进入允许更复杂操作的后期初始化阶段（可以进行可能阻塞的内存分配、子系统完整初始化等）。部分重要步骤（按代码大致顺序）：
 
-4. 后期初始化和用户空间启动：
+这个阶段初始化的子系统（部分列举，按代码大致顺序）：
 
-| 阶段           | 函数/流程                                    | 作用                                              |
-|----------------|----------------------------------------------|---------------------------------------------------|
-| 内核线程启动   | `rest_init()` → `kernel_init()`              | 启动 init 进程(PID=1)，准备进入用户空间          |
-| 驱动初始化     | `do_initcalls()`                             | 按优先级调用所有模块的 `__init` 函数             |
-| 根文件系统挂载 | `prepare_namespace()` → `mount_root()`       | 挂载 rootfs(initramfs 或磁盘根分区)               |
-| 用户空间切换   | `run_init_process("/sbin/init")`             | 执行 init 程序(systemd/busybox)，内核态→用户态   |
-| 多核启动完成   | `smp_init()` → 其他核执行 `cpu_startup_entry()`| 所有 CPU 进入 idle 循环，等待调度                 |
+  * **锁依赖检测调试**：`lockdep_init()`, `locking_selftest()` (需要在开中断环境下测试)。
+  * **后期内存管理**：`setup_per_cpu_pageset()`, `kmem_cache_init_late()` (Slab/Slub 后期初始化)。
+  * **性能分析工具**：`perf_event_init()`, `profile_init()`。
+  * **ACPI/电源管理早期初始化**：`acpi_early_init()`。
+  * **时钟校准**：`calibrate_delay()` (计算 BogoMIPS)。
+  * **架构最终初始化**：`arch_cpu_finalize_init()`。
 
-5. 系统进入稳定运行状态：
-- init 进程启动系统服务(如 udev、网络、登录管理器等)
-- 内核进入事件驱动模式：中断处理 + 系统调用服务
+接下来是一系列重要组件的初始化：
+
+| 关键函数 | 作用描述 |
+| :--- | :--- |
+| `cred_init()`, `fork_init()` | 初始化进程凭证管理，设置进程创建所需的数据结构（如 max\_threads）。 |
+| `security_init()` | **安全框架初始化**。初始化 LSM (Linux Security Modules)，如 SELinux 或 AppArmor。 |
+| `net_ns_init()` | **网络命名空间初始化**。为网络协议栈的初始化做准备。 |
+| `vfs_caches_init()` | **VFS 缓存初始化**（相比 vfs\_caches\_init\_early 更完整）。建立 dentry 和 inode 缓存，这是文件系统工作的基础。 |
+| `proc_root_init()` | 初始化 `/proc` 文件系统。 |
+| `cgroup_init()` | cgroup 完整初始化。 |
+
+
+**6.启动Init进程（PID 1）**
+
+```c
+rest_init(); // 不返回：启动 kernel_init（PID1）与 kthreadd，当前变为 idle
+```
+
+`rest_init` 不会返回，它的主要工作是：
+
+1.  创建一个新的内核线程 `kernel_init`（这将演变为 PID 1 的 init 进程）。
+2.  创建另一个内核线程 `kthreadd`（负责管理所有其他内核线程，PID 2）。
+3.  当前执行 `start_kernel` 的 0 号线程此时化身为 idle 线程（空闲线程），进入无限循环，在没有其他任务运行时被调度执行，通常用于执行低功耗指令。
+
+**后续流程 (在 kernel\_init 线程中):**
+
+  * 调用 `do_initcalls()`：按优先级顺序执行所有编译进内核的驱动程序和模块的 `__init` 函数。
+  * 挂载根文件系统 (Rootfs)。
+  * 寻找并执行用户空间的 init 程序（如 `/sbin/init`, `/lib/systemd/systemd`, `/bin/sh` 等）。
+  * 至此，内核启动完成，系统控制权移交给用户空间。
 
 ### Linux 中断/异常处理流程
 

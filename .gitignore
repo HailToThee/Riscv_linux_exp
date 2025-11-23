@@ -1,0 +1,9 @@
+# Ignore external projects / build dependencies
+busybox/
+linux/
+qemu/
+riscv-gnu-toolchain/
+rootfs.img
+*.bin
+*.elf
+build/
