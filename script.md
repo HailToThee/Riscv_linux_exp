@@ -63,7 +63,7 @@ fence r, w     # load 之后的 store 不能重排到 load 之前（常用于 ac
 fence w, r     # store 之后的 load 不能重排到 store 之前（常用于 release 语义）
 ```
 
-#### 指令获取屏障(fense.i)：
+#### 指令获取屏障(fence.i)：
 fence是对内存的数据访问行为进行排序，而fence.i是对取指行为进行排序。确保 写入内存的指令对后续取指可见。
 
 假设CPU中并无分离的icache和dcache，那么当我们某时刻使用store指令修改内存中的某个指令之后，下一次 CPU 取指时会直接从内存读取最新内容。
@@ -165,6 +165,54 @@ csrr rd, csr  ==   csrrs rd, csr, x0
 写csr的汇编伪指令：
 csrw csr, rs1  ==   csrrw x0, csr, rs1
 ```
+
+### CSR寄存器在Mmod和Smod
+#### M-mode CSR
+`mstatus`:
+状态寄存器，保存了全局中断使能状态和其他状态，例如在切换模式之前保存当前的模式。
+
+`mtvec`:
+异常入口基地址寄存器。保存发生异常时需要跳转的地址。
+
+`medeleg`和`mideleg`:
+​ `medeleg`是异常委托，`mideleg`是中断委托。例如，在M模式下发生异常或中断时，可以通过这两个寄存器，将中断/异常交给S模式或者其他模式处理。
+
+`mip`和`mie`:
+`mie`是中断使能寄存器，对需要使能的中断，在对应位使能。
+`mip`是中断等待寄存器，表示目前正准备处理的中断。
+
+`hpm`:
+全称Hardware Performance Monitor，硬件性能单元，用于性能计数。包括了两类寄存器：`mhpmcounter`和`mhpmevent`
+
+​ `mhpmcounter`：性能计数器
+
+​ `mhpmevent`：用于配置性能事件
+
+`mcounteren`和`mcountinhibit`:
+这两个也是是hpm相关的寄存器，主要用于控制hpm的使能、计数禁止。
+
+​ `mcounteren`：计数器使能
+​ `mcountinhibit`：禁止计数
+
+`mscratch`:
+用于保存M模式指向hart上下文的指针,并在进入M模式的处理程序时，和用户寄存器交换。
+
+`mepc`:
+发生中断时，当前程序的PC值，保存在mepc中，中断返回时，会从mepc读取PC值。
+
+`mcause`:
+​ 用于保存发生中断或异常的情况。
+
+`mtval`:
+异常值寄存器，例如发生异常时，保存出错的地址。
+
+#### S-mode CSR
+S模式的CSR和M模式基本上是一样的，只不过将第一个字母m改为了s，例如mcause改为了scause，mvtal改为了svtal。它们的功能基本相同，这里就不再赘述了。
+
+需要注意的是，S模式除了拥有M模式相同功能的CSR外，另外还增加了一个stap寄存器。
+
+satp寄存器主要是给MMU使用，satp寄存器保存了页表的基地址，MMU通过satp可以找到第一级页表，进而找到物理地址。
+
 ### RVWMO内存一致性模型
 RVWMO即RISC-V Weak Memory Ordering，是RISC-V架构定义的一种内存一致性模型。它允许处理器在执行内存操作时进行一定程度的重排序，以提高性能和并行性。
 
@@ -219,7 +267,7 @@ C拓展允许16位的指令和32位的指令混合，其中32位指令可以从�
 启动参数：
 使用了qemu模拟器，同时使用busybox提供小型的rootfs文件系统，以及支持一个很小的shell环境。
 ```bash
-qemu-system-riscv64   -nographic   -machine virt   -cpu rv64   -m 256M   -bios opensbi/build/platform/generic/firmware/fw_jump.elf   -kernel linux/arch/riscv/boot/Image   -drive file=rootfs.img,if=virtio,format=raw   -append "root=/dev/vda rw console=ttyS0 earlycon=sbi"   -S -s
+qemu-system-riscv64   -nographic   -machine virt   -cpu rv64   -m 256M   -bios opensbi/build/platform/generic/firmware/fw_jump.elf   -kernel linux/arch/riscv/boot/Image   -drive file=rootfs.img,if=virtio,format=raw   -append "root=/dev/vda rw console=ttyS0 earlycon=sbi"   -S -s//启动调试
 ```
 
 ![alt text](004da86a23534372976ddccaccc9df2a.png)
