@@ -1,0 +1,1 @@
+savedcmd_/home/hlt/Riscv_linux_exp/modules/Module.symvers :=  scripts/mod/modpost -M        -o /home/hlt/Riscv_linux_exp/modules/Module.symvers -T /home/hlt/Riscv_linux_exp/modules/modules.order -i Module.symvers -e 

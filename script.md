@@ -1,5 +1,96 @@
 # Linux在RiscV架构上的迁移
 
+## 迁移部分
+```
+mkdir Riscv_linux_exp
+cd Riscv_linux_exp
+```
+安装交叉编译链：
+```
+git clone https://github.com/riscv-collab/riscv-gnu-toolchain.git
+cd riscv-gnu-toolchain
+./configure --prefix=/opt/riscv64 --with-arch=rv64gc --with-abi=lp64d
+sudo make linux
+```
+准备好相关代码仓库：
+```
+git clone https://github.com/qemu/qemu
+git clone https://github.com/torvalds/linux
+git clone https://git.busybox.net/busybox
+```
+编译QEMU：
+```
+cd qemu
+./configure --target-list=riscv64-softmmu
+make -j $(nproc)
+sudo make install
+```
+编译opensbi：
+```
+git clone https://github.com/riscv/opensbi.git
+cd opensbi/
+
+make CROSS_COMPILE=riscv64-unknown-linux-gnu- \
+     PLATFORM=generic \
+     FW_TEXT_START=0x80000000 \
+     -j$(nproc)    //如果这里不设置FW_TEXT_START会导致链接错误
+```
+编译linux内核：
+```
+cd linux
+git checkout v6.12.0
+make ARCH=riscv menuconfig    //在这里开启调试选项，具体来说：
+    --->
+  Kernel hacking  --->
+    [*] Compile the kernel with debug info
+
+```
+检查一下：
+```
+# grep CONFIG_DEBUG_INFO .config
+CONFIG_DEBUG_INFO=y
+
+#随后进行编译
+make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- -j$(nproc)
+```
+
+构建rootfs文件系统：
+```
+dd if=/dev/zero of=rootfs.img bs=1M count=64
+mkfs.ext4 rootfs.img
+
+cd ~/Riscv_linux_exp/busybox
+make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- defconfig
+make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- -j$(nproc)
+
+sudo mkdir -p /mnt/rootfs
+sudo mount -o loop rootfs.img /mnt/rootfs
+sudo cp ./busybox/busybox /mnt/rootfs/bin/busybox
+
+sudo ln -sf busybox /mnt/rootfs/bin/sh
+sudo ln -sf busybox /mnt/rootfs/bin/ls
+sudo ln -sf busybox /mnt/rootfs/bin/cp
+sudo ln -sf busybox /mnt/rootfs/bin/mount
+sudo ln -sf busybox /mnt/rootfs/bin/umount
+sudo ln -sf busybox /mnt/rootfs/bin/cat
+
+sudo umount /mnt/rootfs
+```
+
+启动命令：
+```
+qemu-system-riscv64   -nographic   -machine virt   -cpu rv64   -m 256M   -bios opensbi/build/platform/generic/firmware/fw_jump.elf   -kernel linux/arch/riscv/boot/Image   -drive file=rootfs.img,if=virtio,format=raw   -append "root=/dev/vda rw console=ttyS0 earlycon=sbi"
+```
+开启调试：
+```
+qemu-system-riscv64   -nographic   -machine virt   -cpu rv64   -m 256M   -bios opensbi/build/platform/generic/firmware/fw_jump.elf   -kernel linux/arch/riscv/boot/Image   -drive file=rootfs.img,if=virtio,format=raw   -append "root=/dev/vda rw console=ttyS0 earlycon=sbi"   -S -s
+```
+在另一个终端开启监听：
+```
+riscv64-unknown-linux-gnu-gdb vmlinux  //对内核启动过程进行调试
+riscv64-unknown-linux-gnu-gdb   opensbi/build/platform/generic/firmware/fw_jump.elf  //对opensbi进行调试
+(gdb) target remote :1234
+```
 ## Riscv部分基础指令集：
 ### RiscV 基础整数编程模型
 RiscV类似于Linux的原因之一便是其拓展指令集的模块化，在拓展指令集之上可以分为整数指令集（I）、乘除法扩展（M）、原子操作扩展（A）、单精度浮点扩展（F）、双精度浮点扩展（D）等。
@@ -729,58 +820,278 @@ struct pt_regs {
 	unsigned long orig_a0;
 };
 ```
+## GDB实现调试
+```
+qemu-system-riscv64   -nographic   -machine virt   -cpu rv64   -m 256M   -bios opensbi/build/platform/generic/firmware/fw_jump.elf   -kernel linux/arch/riscv/boot/Image   -drive file=rootfs.img,if=virtio,format=raw   -append "root=/dev/vda rw console=ttyS0 earlycon=sbi"   -S -s
+```
+![alt text](image-2.png)
+![alt text](image-3.png)
+现在我们的位置是0x0000000000001000，显示为 in ?? ()
 
-## 实验难点攻克与调试记录
-本实验过程中遇到了多个极具挑战性的技术难题，通过查阅文档、修改源码和 GDB 调试逐一解决。
+说明目前GDB还没有加载Opensbi的符号当前位于Opensbi硬件附近。
+由之前对linux源码的分析，我们知道linux的入口在head.S的_start附近，所以我们设置断点：
+```
+(gdb)b _start_kernel
+```
+注意这里就出现了一个问题：当我们设置断点时，GDB也找到了在0xffffff80000000处的_start_kernel函数，这个是linux内核的_start_kernel函数, 对应的VA
+此时如果我们直接c，那么会直接跳过函数直接到shell。
 
-### 难点一：OpenSBI 与 Linux 内核的设备树 (DTB) 传递问题
-*   **问题现象**：内核启动后卡在 `Booting Linux on physical CPU 0...`，无任何后续输出。
-*   **分析过程**：
-    *   使用 GDB 连接 QEMU，在 `setup_arch` 处打断点，发现并未触发。
-    *   分析 OpenSBI 源码，发现它会修改传递给内核的 `a1` 寄存器（存放 DTB 地址）。
-    *   检查 QEMU 启动参数，发现未正确指定 `-append "console=ttyS0"`，导致内核虽然启动了但没有输出到串口。
-*   **解决方案**：修正 QEMU 启动参数，并确保内核配置中 `CONFIG_SERIAL_EARLYCON=y`，以便在驱动加载前就能看到打印信息。
+查询原因：找到了这样一个issue：https://zhuanlan.zhihu.com/p/659143834
 
-### 难点二：交叉编译链的动态链接库依赖陷阱
-*   **问题现象**：BusyBox 编译出的 `init` 程序在 QEMU 中执行时报错 `Kernel panic - not syncing: Requested init /bin/init failed`。
-*   **深度分析**：
-    1.  **初步排查**：检查 VFS 挂载日志正常，文件权限正常。
-    2.  **ELF 分析**：使用 `readelf` 工具分析 `init` 二进制文件。
-        ```bash
-        $ riscv64-linux-gnu-readelf -l init | grep interpreter
-        [Requesting program interpreter: /lib/ld-linux-riscv64-lp64d.so.1]
-        ```
-        发现该程序依赖动态链接器 `/lib/ld-linux-riscv64-lp64d.so.1`。
-    3.  **依赖检查**：进一步检查动态库依赖。
-        ```bash
-        $ riscv64-linux-gnu-readelf -d init | grep NEEDED
-        0x0000000000000001 (NEEDED)             Shared library: [libm.so.6]
-        0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
-        ```
-    4.  **根因定位**：构建 Rootfs 时仅拷贝了 BusyBox 二进制文件，未拷贝交叉编译工具链中的 `sysroot` 库文件。
-*   **解决方案**：
-    *   定位交叉编译工具链的 sysroot 路径：`riscv64-linux-gnu-gcc -print-sysroot`。
-    *   将 `libc.so.6`, `libm.so.6`, `ld-linux-riscv64-lp64d.so.1` 等核心库完整复制到 Rootfs 的 `/lib` 目录。
+它提到：由于MMU 还是处于关闭状态，故 cpu 发出的VA 不会经过 MMU 翻译，VA 就是 PA。从我的环境看到 kernel 被加载到 0x40080000 的物理地址执行，它根本不会执行到 0xffff000010080000 地址处的指令。
 
-### 难点三：SV39 缺页异常调试与 Oops 分析
-*   **问题现象**：在添加自定义系统调用时，触发了 `Load Page Fault`，内核打印 Oops 信息。
-*   **调试过程**：
-    1.  **获取 Oops 信息**：
-        ```txt
-        Unable to handle kernel paging request at virtual address 0000000000000010
-        Oops: 0000 [#1] SMP
-        CPU: 0 PID: 1 Comm: init Not tainted 5.10.0 #1
-        epc : ffffffe000201abc ra : ffffffe000201aa0 sp : ffffffe000403e90
-        ...
-        ```
-    2.  **定位代码行**：使用 `addr2line` 工具将 `epc` (Exception Program Counter) 地址转换为源码行号。
-        ```bash
-        $ riscv64-linux-gnu-addr2line -e vmlinux ffffffe000201abc
-        /path/to/linux/arch/riscv/kernel/syscall.c:45
-        ```
-    3.  **GDB 动态调试**：
-        *   启动 QEMU 并挂起：`qemu-system-riscv64 ... -s -S`
-        *   连接 GDB：`target remote :1234`
-        *   设置断点：`break *0xffffffe000201abc`
-        *   查看寄存器：`info registers`，发现 `a0` 寄存器（参数）为 NULL，导致解引用错误。
-*   **解决方案**：严格遵守内核内存访问规范，使用 `copy_from_user`/`copy_to_user` 宏来处理用户空间数据，确保权限检查和异常捕获机制生效。
+因此我们需要手动跳转到对应的部分：
+![alt text](image-5.png)
+这样我们就可以对head.S进行单步调试了。
+![alt text](image-6.png)
+
+一般来说我们会调试内核的start_kernel函数，因为这个函数是C语言实现的，调试起来更方便。
+```
+b start_kernel
+```
+![alt text](image-7.png)
+我们可以通过设置断点单步进入start_kernel函数，观察内核的初始化过程。
+
+
+## Linux实验测试
+上述都是对整个linux在riscv上启动过程的分析，其中对于系统调用的实现和内核模块的编写是我们实验的重点，下面我们来完成一下实验测试。
+
+### 1.实验目标：
+在Risc-V架构的Linux系统上，完成以下任务：
+- 添加一个自定义系统调用（System Call）。
+- 编写并运行一个简单的内核模块（Kernel Module）。
+- 完善 RootFS 的启动脚本，实现自动挂载和环境配置。
+
+通过查看源码，我们发现syscall的系统调用最大是462：
+```c
+#define __NR_mseal 462
+__SYSCALL(__NR_mseal, sys_mseal)
+
+#undef __NR_syscalls
+#define __NR_syscalls 463
+```
+我们需要添加一个系统调用：
+
+### 2.添加自定义系统调用
+#### 一：定义系统调用号
+在 `arch/riscv/include/asm/unistd.h` 中添加新的系统调用号：
+```c
+#define __NR_riscv_hello 463
+/* 将 __NR_syscalls 更新为 464 */
+#undef __NR_syscalls
+#define __NR_syscalls 464
+```
+#### 二：实现系统调用函数
+在arch/riscv/kernel/sys_riscv.c 末尾添加实现函数：
+```c
+#include <linux/kernel.h>
+#include <linux/syscalls.h>
+
+SYSCALL_DEFINE1(riscv_hello, char __user *, name)
+{
+    char buf[256];
+    long len;
+	
+    len = strncpy_from_user(buf, name, sizeof(buf));
+    if (len < 0)
+        return len;
+
+    printk(KERN_INFO "[System Call] Hello, %s! Welcome to RISC-V Linux.\n", buf);
+    
+    return 0;
+}
+```
+
+#### 三：实现系统调用测试
+编写用户空间测试程序 `syscall_test.c`：
+```c
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <stdio.h>
+
+#define __NR_riscv_hello 463
+
+int main() {
+    printf("User: Calling system call 463...\n");
+    // 使用 syscall 函数触发
+    long ret = syscall(__NR_riscv_hello, "Student");
+    
+    if (ret == 0) {
+        printf("User: System call returned successfully.\n");
+    } else {
+        perror("User: System call failed");
+    }
+    
+    return 0;
+}
+```
+这里我们编译这个程序，并将其放入RootFS的/bin目录下，方便后续测试。
+
+```bash
+riscv64-unknown-linux-gnu-gcc syscall_test.c -o syscall_test -static
+```
+
+### 3.编写内核模块
+创建 hello_module.c，使用 module_init 和 module_exit 宏定义加载和卸载时的行为，通过 printk 输出调试信息。
+
+编写 Makefile 使用内核构建系统进行交叉编译
+```c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Student");
+MODULE_DESCRIPTION("A simple RISC-V Kernel Module");
+
+static int __init hello_init(void)
+{
+    unsigned long sstatus;
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    
+    printk(KERN_INFO "Hello Module: Loaded!\n");
+    printk(KERN_INFO "Hello Module: Current sstatus = 0x%lx\n", sstatus);
+    return 0;
+}
+
+static void __exit hello_exit(void)
+{
+    printk(KERN_INFO "Hello Module: Unloaded. Goodbye!\n");
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+```
+
+编写 Makefile 使用内核构建系统进行交叉编译
+```Makefile
+obj-m += hello_module.o
+
+KDIR := /home/hlt/Riscv_linux_exp/linux
+
+all:
+	make -C $(KDIR) M=$(PWD) ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- modules
+
+clean:
+	make -C $(KDIR) M=$(PWD) ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- clean
+```
+
+由于内核模块需要在目标系统上加载，因此需要将编译好的模块文件复制到 RootFS 中。
+但是如果每次都手动挂载和复制文件会很麻烦，所以我们编写一个脚本来自动化这个过程。
+
+### 4.自动化 RootFS 构建
+编写 `setup_rootfs.sh` 脚本，解决每次手动挂载和复制文件的繁琐问题。
+
+```bash
+#!/bin/bash
+set -e
+
+ROOTFS_IMG="rootfs.img"
+MOUNT_POINT="/mnt/rootfs"
+
+if [ "$EUID" -ne 0 ]; then
+  echo "please run as root"
+  exit 1
+fi
+
+mkdir -p $MOUNT_POINT
+mount -o loop $ROOTFS_IMG $MOUNT_POINT
+
+mkdir -p $MOUNT_POINT/proc
+mkdir -p $MOUNT_POINT/sys
+mkdir -p $MOUNT_POINT/dev
+mkdir -p $MOUNT_POINT/etc/init.d
+mkdir -p $MOUNT_POINT/root
+
+# 创建启动脚本
+cat > $MOUNT_POINT/etc/init.d/rcS <<EOF
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+/sbin/mdev -s
+echo "Welcome to RISC-V Linux Lab"
+/bin/sh
+EOF
+chmod +x $MOUNT_POINT/etc/init.d/rcS
+
+if [ -f "syscall_test" ]; then
+    cp syscall_test $MOUNT_POINT/bin/
+fi
+
+if [ -f "modules/hello_module.ko" ]; then
+    cp modules/hello_module.ko $MOUNT_POINT/root/
+fi
+
+umount $MOUNT_POINT
+echo "RootFS Rebuilt successfully."
+```
+运行：
+```bash
+chmod +x setup_rootfs.sh
+sudo bash setup_rootfs.sh
+```
+### 实验结果验证
+
+首先检查是否真的注册了新的系统调用：
+```
+(base) hlt@hlt:~/Riscv_linux_exp/linux$ ls -l arch/riscv/kernel/syscall_table.o arch/riscv/include/generated/asm/syscall_table_64.h && tail -n 5 arch/riscv/include/generated/asm/syscall_table_64.h
+-rw-r--r-- 1 hlt hlt  16073 Jan  2 23:36 arch/riscv/include/generated/asm/syscall_table_64.h
+-rw-r--r-- 1 hlt hlt 388136 Jan  2 23:36 arch/riscv/kernel/syscall_table.o
+__SYSCALL(459, sys_lsm_get_self_attr)
+__SYSCALL(460, sys_lsm_set_self_attr)
+__SYSCALL(461, sys_lsm_list_modules)
+__SYSCALL(462, sys_mseal)
+__SYSCALL(463, sys_riscv_hello)
+```
+这里可以看到我们的系统调用号463成功添加到了syscall_table_64.h中。
+
+接下来我们启动看一下效果：
+```
+(base) hlt@hlt:~/Riscv_linux_exp$ qemu-system-riscv64 -nographic -machine virt -cpu rv64 -m 256M     -bios opensbi/build/platform/generic/firmware/fw_jump.elf     -kernel linux/arch/riscv/boot/Image     -drive file=rootfs.img,if=virtio,format=raw     -append "root=/dev/vda rw console=ttyS0 earlycon=sbi init=/linuxrc"
+ 
+启动之后：
+由于我们已经编译好了syscall_test并放到了rootfs的/bin目录下，所以我们直接运行它：
+
+~ # /bin/syscall_test
+User: Calling system call 463...
+[    7.626614] [System Call] Hello, Student! Welcome to RISC-V Linux.
+User: System call returned successfully.
+```
+
+接着检查一下是否能够正确加载内核模块：
+```
+~ # insmod /root/hello_module.ko 
+[ 1301.388225] Hello Module: Loaded!
+[ 1301.388624] Hello Module: Current sstatus = 0x200000022
+~ # lsmod 
+hello_module 12288 0 - Live 0xffffffff01796000 (O)
+~ # rmmod hello_module
+[ 1310.380322] Hello Module: Unloaded. Goodbye!
+~ # dmesg | tail -n 10
+[    1.712480]     HOME=/
+[    1.712550]     TERM=linux
+[    7.626614] [System Call] Hello, Student! Welcome to RISC-V Linux.
+[ 1256.888086] hello_module: loading out-of-tree module taints kernel.
+[ 1256.901562] Hello Module: Loaded!
+[ 1256.901908] Hello Module: Current sstatus = 0x200000022
+[ 1282.826645] Hello Module: Unloaded. Goodbye!
+[ 1301.388225] Hello Module: Loaded!
+[ 1301.388624] Hello Module: Current sstatus = 0x200000022
+[ 1310.380322] Hello Module: Unloaded. Goodbye!
+~ # 
+```
+成功了。
+### 5.遇到的问题与解决方案
+**问题**：系统调用返回 `Function not implemented` (errno 38)。
+**原因**：Linux 内核构建系统（Kbuild）未能正确检测到 `unistd.h` 的修改，导致架构相关的生成头文件 `arch/riscv/include/generated/asm/syscall_table_64.h` 没有重新生成。
+**解决**：
+
+1.**手动修补头文件**：直接编辑 `arch/riscv/include/generated/asm/syscall_table_64.h`，在末尾添加：
+   ```c
+   __SYSCALL(463, sys_riscv_hello)
+   ```
+2.**强制重新编译**：删除旧的目标文件 `arch/riscv/kernel/syscall_table.o`，强迫编译器使用更新后的头文件重新生成系统调用表对象。
+   ```bash
+   rm arch/riscv/kernel/syscall_table.o
+   make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- -j$(nproc)
+   ```

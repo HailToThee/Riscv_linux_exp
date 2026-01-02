@@ -1,0 +1,1 @@
+savedcmd_/home/hlt/Riscv_linux_exp/modules/hello_module.mod := printf '%s\n'   hello_module.o | awk '!x[$$0]++ { print("/home/hlt/Riscv_linux_exp/modules/"$$0) }' > /home/hlt/Riscv_linux_exp/modules/hello_module.mod
