@@ -1,4 +1,64 @@
 # Linux在RiscV架构上的迁移
+## 目录：
+
+<!-- @import "[TOC]" {cmd="toc" depthFrom=1 depthTo=6 orderedList=false} -->
+
+<!-- code_chunk_output -->
+
+- [Linux在RiscV架构上的迁移](#linux在riscv架构上的迁移)
+  - [目录：](#目录)
+  - [迁移部分](#迁移部分)
+  - [Riscv部分基础指令集：](#riscv部分基础指令集)
+    - [RiscV 基础整数编程模型](#riscv-基础整数编程模型)
+    - [基础指令格式](#基础指令格式)
+    - [基础的一些汇编指令](#基础的一些汇编指令)
+    - [第一次读处理器架构见到的指令](#第一次读处理器架构见到的指令)
+      - [内存排序指令(fence)：](#内存排序指令fence)
+      - [指令获取屏障(fence.i)：](#指令获取屏障fencei)
+      - [环境调用和断点](#环境调用和断点)
+    - [原子操作:](#原子操作)
+      - [AMO原子内存操作:](#amo原子内存操作)
+      - [LR/SC:](#lrsc)
+    - [控制与状态寄存器指令(CSR)](#控制与状态寄存器指令csr)
+    - [CSR寄存器在Mmod和Smod](#csr寄存器在mmod和smod)
+      - [M-mode CSR](#m-mode-csr)
+      - [S-mode CSR](#s-mode-csr)
+    - [RVWMO内存一致性模型](#rvwmo内存一致性模型)
+      - [不允许重排序](#不允许重排序)
+      - [允许重排序](#允许重排序)
+      - [保留的程序次序](#保留的程序次序)
+    - [C标准拓展（压缩）](#c标准拓展压缩)
+  - [Linux Riscv的迁移](#linux-riscv的迁移)
+    - [Linux启动流程：](#linux启动流程)
+    - [OpenSBI简介](#opensbi简介)
+      - [动机：](#动机)
+      - [三种用法：](#三种用法)
+      - [OpenSBI的链接脚本和启动汇编：](#opensbi的链接脚本和启动汇编)
+    - [OpenSBI初始化：](#opensbi初始化)
+    - [Linux初始化过程](#linux初始化过程)
+    - [Linux 中断/异常处理流程](#linux-中断异常处理流程)
+      - [异常处理入口](#异常处理入口)
+      - [SBI 调用示例:](#sbi-调用示例)
+      - [SV39分页机制](#sv39分页机制)
+      - [SV39 页表初始化与内核重定位](#sv39-页表初始化与内核重定位)
+    - [进程上下文切换的汇编实现 (`__switch_to`)](#进程上下文切换的汇编实现-__switch_to)
+    - [异常处理与内核栈布局 (`pt_regs`)](#异常处理与内核栈布局-pt_regs)
+  - [GDB调试和设备树分析](#gdb调试和设备树分析)
+    - [调试启动](#调试启动)
+    - [设备树分析](#设备树分析)
+  - [Linux实验测试](#linux实验测试)
+    - [1.实验目标：](#1实验目标)
+    - [2.添加自定义系统调用](#2添加自定义系统调用)
+      - [一：定义系统调用号](#一定义系统调用号)
+      - [二：实现系统调用函数](#二实现系统调用函数)
+      - [三：实现系统调用测试](#三实现系统调用测试)
+    - [3.编写内核模块](#3编写内核模块)
+    - [4.自动化 RootFS 构建](#4自动化-rootfs-构建)
+    - [实验结果验证](#实验结果验证)
+    - [5.遇到的问题与解决方案](#5遇到的问题与解决方案)
+
+<!-- /code_chunk_output -->
+
 
 ## 迁移部分
 ```
@@ -199,11 +259,11 @@ amomax[u].w rd, rs2, (rs1)   # 将内存地址(rs1)处的值与rs2的值进行�
 #### LR/SC:
 虽然 AMO 指令可以高效完成“读-改-写”类的固定原子操作（如加法、交换等），但无法实现条件性原子操作（如仅当内存值等于某个预期值时才进行更新）。为了解决这个问题，RISC-V 引入了 Load-Reserved (LR) 和 Store-Conditional (SC) 指令对。
 
-##### LR:从内存地址加载一个值到寄存器,同时，对该地址设置一个“保留标记”（reservation），表示当前 hart（硬件线程）正在“监视”这块内存
+**LR:从内存地址加载一个值到寄存器,同时，对该地址设置一个“保留标记”（reservation），表示当前 hart（硬件线程）正在“监视”这块内存**
 ```asm
 lr.w rd, (rs1)  # 从内存地址(rs1)加载一个字到寄存器rd，并设置保留标记
 ```
-##### SC:尝试将寄存器的值存回内存地址，但只有在该地址的保留标记仍然有效时才成功
+**SC:尝试将寄存器的值存回内存地址，但只有在该地址的保留标记仍然有效时才成功**
 ```asm
 sc.w rd, rs2, (rs1)  # 尝试将寄存器rs2的值存回内存地址(rs1)
                         if rd == 0 success!
@@ -820,7 +880,8 @@ struct pt_regs {
 	unsigned long orig_a0;
 };
 ```
-## GDB实现调试
+## GDB调试和设备树分析
+### 调试启动
 ```
 qemu-system-riscv64   -nographic   -machine virt   -cpu rv64   -m 256M   -bios opensbi/build/platform/generic/firmware/fw_jump.elf   -kernel linux/arch/riscv/boot/Image   -drive file=rootfs.img,if=virtio,format=raw   -append "root=/dev/vda rw console=ttyS0 earlycon=sbi"   -S -s
 ```
@@ -852,6 +913,23 @@ b start_kernel
 ![alt text](image-7.png)
 我们可以通过设置断点单步进入start_kernel函数，观察内核的初始化过程。
 
+### 设备树分析
+设备树（Device Tree）是一种数据结构，用于描述硬件设备的拓扑结构和配置信息。它以树形结构组织，节点表示设备或设备组，属性描述设备的特性和配置参数。
+对于Risc-V Linux的启动依赖DTS来识别硬件：
+- 内存范围
+- CPU核心
+- 外设地址
+
+在QEMU中导出设备树：
+```
+riscv64-unknown-linux-gnu-objdump -d linux/arch/riscv/boot/dts/qemu-virt.dtb
+```
+我们可以使用`dtc`工具将二进制的设备树文件转换为可读的文本格式：
+```
+dtc -I dtb -O dts linux/arch/riscv/boot/dts/qemu-virt.dtb -o qemu-virt.dts
+```
+截取部分内容：
+
 
 ## Linux实验测试
 上述都是对整个linux在riscv上启动过程的分析，其中对于系统调用的实现和内核模块的编写是我们实验的重点，下面我们来完成一下实验测试。
@@ -862,6 +940,8 @@ b start_kernel
 - 编写并运行一个简单的内核模块（Kernel Module）。
 - 完善 RootFS 的启动脚本，实现自动挂载和环境配置。
 
+### 2.添加自定义系统调用
+#### 一：定义系统调用号
 通过查看源码，我们发现syscall的系统调用最大是462：
 ```c
 #define __NR_mseal 462
@@ -872,8 +952,6 @@ __SYSCALL(__NR_mseal, sys_mseal)
 ```
 我们需要添加一个系统调用：
 
-### 2.添加自定义系统调用
-#### 一：定义系统调用号
 在 `arch/riscv/include/asm/unistd.h` 中添加新的系统调用号：
 ```c
 #define __NR_riscv_hello 463
