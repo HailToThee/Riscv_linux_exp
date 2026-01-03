@@ -56,8 +56,11 @@
     - [4.自动化 RootFS 构建](#4自动化-rootfs-构建)
     - [实验结果验证](#实验结果验证)
     - [5.遇到的问题与解决方案](#5遇到的问题与解决方案)
+  - [总结](#总结)
 
 <!-- /code_chunk_output -->
+
+
 
 
 ## 迁移部分
@@ -1011,7 +1014,6 @@ riscv64-unknown-linux-gnu-gcc syscall_test.c -o syscall_test -static
 
 ### 3.编写内核模块
 创建 hello_module.c，使用 module_init 和 module_exit 宏定义加载和卸载时的行为，通过 printk 输出调试信息。
-
 编写 Makefile 使用内核构建系统进行交叉编译
 ```c
 #include <linux/module.h>
@@ -1053,8 +1055,7 @@ all:
 clean:
 	make -C $(KDIR) M=$(PWD) ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- clean
 ```
-
-由于内核模块需要在目标系统上加载，因此需要将编译好的模块文件复制到 RootFS 中。
+由于我们所创建的系统中没有环境支持，因此内核模块需要我们在外部编译好加载到RootFS中
 但是如果每次都手动挂载和复制文件会很麻烦，所以我们编写一个脚本来自动化这个过程。
 
 ### 4.自动化 RootFS 构建
@@ -1173,3 +1174,8 @@ hello_module 12288 0 - Live 0xffffffff01796000 (O)
    rm arch/riscv/kernel/syscall_table.o
    make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- -j$(nproc)
    ```
+
+## 总结
+总体来看通过这项实验我理解了Linux的启动流程，Opensbi在系统启动中所扮演的角色，Risc-V的一部分常用指令集，以及如何在Linux中自定义系统调用和用户使用系统调用，如何分析系统的映射空间，如何插入自定义的内核模块。
+
+这项实验是在Risc-V上迁移linux的实验，尽管之前的操作系统实验中我也学到过在Risc-V的架构上从零编写一个操作系统（rCore），这项实验还是给我带来了不少的收获，原因首先在于rCore全部是由Rust+汇编以及一小部分的C通过extern "C"引入，而Linux部分的代码量太大，实现一个功能所需要的层级文件太多，且一些外部库的引用位置不清楚，再加上启动过程的许多汇编的代码，导致阅读很困难。其二是对于操作系统启动中的许多操作并不了解，要初始化的各种部分以及对齐和设置的各种空间，造成了理解上的困难。配合《计算机体系结构》、《Linux Kernel Development》的学习应该会更好。
