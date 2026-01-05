@@ -1,4 +1,11 @@
 # Linux在RiscV架构上的迁移
+
+信安2301薛家成
+
+学号：8208230705
+
+具体实验部分的代码目录和报告可以访问：
+https://github.com/HailToThee/Riscv_linux_exp.git
 ## 目录：
 
 <!-- @import "[TOC]" {cmd="toc" depthFrom=1 depthTo=6 orderedList=false} -->
@@ -8,8 +15,8 @@
 - [Linux在RiscV架构上的迁移](#linux在riscv架构上的迁移)
   - [目录：](#目录)
   - [迁移部分](#迁移部分)
-  - [Riscv部分基础指令集：](#riscv部分基础指令集)
-    - [RiscV 基础整数编程模型](#riscv-基础整数编程模型)
+  - [Risc-V部分基础指令集：](#risc-v部分基础指令集)
+    - [Risc-V 基础整数编程模型](#risc-v-基础整数编程模型)
     - [基础指令格式](#基础指令格式)
     - [基础的一些汇编指令](#基础的一些汇编指令)
     - [第一次读处理器架构见到的指令](#第一次读处理器架构见到的指令)
@@ -28,7 +35,7 @@
       - [允许重排序](#允许重排序)
       - [保留的程序次序](#保留的程序次序)
     - [C标准拓展（压缩）](#c标准拓展压缩)
-  - [Linux Riscv的迁移](#linux-riscv的迁移)
+  - [Linux Risc-V整体流程分析](#linux-risc-v整体流程分析)
     - [Linux启动流程：](#linux启动流程)
     - [OpenSBI简介](#opensbi简介)
       - [动机：](#动机)
@@ -154,8 +161,8 @@ riscv64-unknown-linux-gnu-gdb vmlinux  //对内核启动过程进行调试
 riscv64-unknown-linux-gnu-gdb   opensbi/build/platform/generic/firmware/fw_jump.elf  //对opensbi进行调试
 (gdb) target remote :1234
 ```
-## Riscv部分基础指令集：
-### RiscV 基础整数编程模型
+## Risc-V部分基础指令集：
+### Risc-V 基础整数编程模型
 RiscV类似于Linux的原因之一便是其拓展指令集的模块化，在拓展指令集之上可以分为整数指令集（I）、乘除法扩展（M）、原子操作扩展（A）、单精度浮点扩展（F）、双精度浮点扩展（D）等。
 
 在基础整数ISA上并没有专门的栈指针或子程序返回地址链接的寄存器；指令编码允许任何的x寄存器用于这些目的。但是，RiscV约定了某些寄存器用于特定的用途，以便于软件的编写和理解。
@@ -414,7 +421,7 @@ RVC 使用了一个简单的压缩策略，它提供常见 32 位 RISC-V 指令�
 
 C拓展允许16位的指令和32位的指令混合，其中32位指令可以从任何16位的边界开始。
 
-## Linux Riscv的迁移
+## Linux Risc-V整体流程分析
 
 ### Linux启动流程：
 
@@ -925,14 +932,269 @@ b start_kernel
 
 在QEMU中导出设备树：
 ```
-riscv64-unknown-linux-gnu-objdump -d linux/arch/riscv/boot/dts/qemu-virt.dtb
-```
-我们可以使用`dtc`工具将二进制的设备树文件转换为可读的文本格式：
-```
-dtc -I dtb -O dts linux/arch/riscv/boot/dts/qemu-virt.dtb -o qemu-virt.dts
-```
-截取部分内容：
+~ # mkdir /dtb-export
 
+~ # cp -a /sys/firmware/devicetree/base/* /dtb-export/
+~ # sync
+## EXIT TO HOST
+```
+
+在host中挂载rootfs.img得到刚刚提取出来的dtb-export目录：
+
+```
+(base) hlt@hlt:~/Riscv_linux_exp$ sudo mount -o loop rootfs.img /tmp/rootfs-mount
+
+(base) hlt@hlt:~/Riscv_linux_exp$ sudo dtc -I fs -O dts -o result.dts /tmp/rootfs-mount/dtb-export
+```
+```
+#cat result.dts
+/dts-v1/;
+
+/ {
+        #address-cells = <0x02>;
+        #size-cells = <0x02>;
+        compatible = "riscv-virtio";
+        model = "riscv-virtio,qemu";
+
+        aliases {
+                serial0 = "/soc/serial@10000000";
+        };
+
+        chosen {
+                bootargs = "root=/dev/vda rw console=ttyS0 earlycon=sbi";
+                stdout-path = "/soc/serial@10000000";
+        };
+
+        cpus {
+                #address-cells = <0x01>;
+                #size-cells = <0x00>;
+                timebase-frequency = <0x989680>;
+
+                cpu-map {
+
+                        cluster0 {
+
+                                core0 {
+                                        cpu = <0x01>;
+                                };
+                        };
+                };
+
+                cpu@0 {
+                        device_type = "cpu";
+                        compatible = "riscv";
+                        mmu-type = "riscv,sv57";
+                        status = "okay";
+                        riscv,isa-base = "rv64i";
+                        riscv,cbop-block-size = <0x40>;
+                        riscv,isa-extensions = "i\0m\0a\0f\0d\0c\0h\0zic64b\0zicbom\0zicbop\0zicboz\0ziccamoa\0ziccif\0zicclsm\0ziccrse\0zicntr\0zicsr\0zifencei\0zihintntl\0zihintpause\0zihpm\0zmmul\0za64rs\0zaamo\0zalrsc\0zawrs\0zfa\0zca\0zcd\0zba\0zbb\0zbc\0zbs\0shcounterenw\0shgatpa\0shtvala\0shvsatpa\0shvstvala\0shvstvecd\0ssccptr\0sscounterenw\0sstc\0sstvala\0sstvecd\0ssu64xl\0svadu\0svvptc";
+                        reg = <0x00>;
+                        phandle = <0x01>;
+                        riscv,cboz-block-size = <0x40>;
+                        riscv,isa = "rv64imafdch_zic64b_zicbom_zicbop_zicboz_ziccamoa_ziccif_zicclsm_ziccrse_zicntr_zicsr_zifencei_zihintntl_zihintpause_zihpm_zmmul_za64rs_zaamo_zalrsc_zawrs_zfa_zca_zcd_zba_zbb_zbc_zbs_shcounterenw_shgatpa_shtvala_shvsatpa_shvstvala_shvstvecd_ssccptr_sscounterenw_sstc_sstvala_sstvecd_ssu64xl_svadu_svvptc";
+                        riscv,cbom-block-size = <0x40>;
+
+                        interrupt-controller {
+                                compatible = "riscv,cpu-intc";
+                                #interrupt-cells = <0x01>;
+                                phandle = <0x02>;
+                                interrupt-controller;
+                        };
+                };
+        };
+
+        flash@20000000 {
+                bank-width = <0x04>;
+                compatible = "cfi-flash";
+                reg = <0x00 0x20000000 0x00 0x2000000 0x00 0x22000000 0x00 0x2000000>;
+        };
+
+        fw-cfg@10100000 {
+                dma-coherent;
+                compatible = "qemu,fw-cfg-mmio";
+                reg = <0x00 0x10100000 0x00 0x18>;
+        };
+
+        memory@80000000 {
+                device_type = "memory";
+                reg = <0x00 0x80000000 0x00 0x10000000>;
+        };
+
+        platform-bus@4000000 {
+                #address-cells = <0x01>;
+                #size-cells = <0x01>;
+                interrupt-parent = <0x03>;
+                compatible = "qemu,platform\0simple-bus";
+                ranges = <0x00 0x00 0x4000000 0x2000000>;
+        };
+
+        pmu {
+                compatible = "riscv,pmu";
+        };
+
+        poweroff {
+                offset = <0x00>;
+                compatible = "syscon-poweroff";
+                value = <0x5555>;
+                regmap = <0x04>;
+        };
+
+        reboot {
+                offset = <0x00>;
+                compatible = "syscon-reboot";
+                value = <0x7777>;
+                regmap = <0x04>;
+        };
+
+        reserved-memory {
+                #address-cells = <0x02>;
+                #size-cells = <0x02>;
+                ranges;
+
+                mmode_resv0@80040000 {
+                        reg = <0x00 0x80040000 0x00 0x20000>;
+                        no-map;
+                };
+
+                mmode_resv1@80000000 {
+                        reg = <0x00 0x80000000 0x00 0x40000>;
+                        no-map;
+                };
+        };
+
+        soc {
+                #address-cells = <0x02>;
+                #size-cells = <0x02>;
+                compatible = "simple-bus";
+                ranges;
+
+                clint@2000000 {
+                        interrupts-extended = <0x02 0x03 0x02 0x07>;
+                        compatible = "sifive,clint0\0riscv,clint0";
+                        reg = <0x00 0x2000000 0x00 0x10000>;
+                };
+
+                virtio_mmio@10007000 {
+                        interrupts = <0x07>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10007000 0x00 0x1000>;
+                };
+
+                virtio_mmio@10004000 {
+                        interrupts = <0x04>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10004000 0x00 0x1000>;
+                };
+
+                virtio_mmio@10001000 {
+                        interrupts = <0x01>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10001000 0x00 0x1000>;
+                };
+
+                plic@c000000 {
+                        #address-cells = <0x00>;
+                        interrupts-extended = <0x02 0xffffffff 0x02 0x09>;
+                        compatible = "sifive,plic-1.0.0\0riscv,plic0";
+                        #interrupt-cells = <0x01>;
+                        reg = <0x00 0xc000000 0x00 0x600000>;
+                        phandle = <0x03>;
+                        riscv,ndev = <0x5f>;
+                        interrupt-controller;
+                };
+
+                virtio_mmio@10006000 {
+                        interrupts = <0x06>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10006000 0x00 0x1000>;
+                };
+
+                virtio_mmio@10003000 {
+                        interrupts = <0x03>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10003000 0x00 0x1000>;
+                };
+
+                serial@10000000 {
+                        interrupts = <0x0a>;
+                        interrupt-parent = <0x03>;
+                        clock-frequency = "\08@";
+                        compatible = "ns16550a";
+                        reg = <0x00 0x10000000 0x00 0x100>;
+                };
+
+                pci@30000000 {
+                        #address-cells = <0x03>;
+                        dma-coherent;
+                        bus-range = <0x00 0xff>;
+                        interrupt-map = <0x00 0x00 0x00 0x01 0x03 0x20 0x00 0x00 0x00 0x02 0x03 0x21 0x00 0x00 0x00 0x03 0x03 0x22 0x00 0x00 0x00 0x04 0x03 0x23 0x800 0x00 0x00 0x01 0x03 0x21 0x800 0x00 0x00 0x02 0x03 0x22 0x800 0x00 0x00 0x03 0x03 0x23 0x800 0x00 0x00 0x04 0x03 0x20 0x1000 0x00 0x00 0x01 0x03 0x22 0x1000 0x00 0x00 0x02 0x03 0x23 0x1000 0x00 0x00 0x03 0x03 0x20 0x1000 0x00 0x00 0x04 0x03 0x21 0x1800 0x00 0x00 0x01 0x03 0x23 0x1800 0x00 0x00 0x02 0x03 0x20 0x1800 0x00 0x00 0x03 0x03 0x21 0x1800 0x00 0x00 0x04 0x03 0x22>;
+                        #size-cells = <0x02>;
+                        device_type = "pci";
+                        interrupt-map-mask = <0x1800 0x00 0x00 0x07>;
+                        compatible = "pci-host-ecam-generic";
+                        ranges = <0x1000000 0x00 0x00 0x00 0x3000000 0x00 0x10000 0x2000000 0x00 0x40000000 0x00 0x40000000 0x00 0x40000000 0x3000000 0x04 0x00 0x04 0x00 0x04 0x00>;
+                        #interrupt-cells = <0x01>;
+                        reg = <0x00 0x30000000 0x00 0x10000000>;
+                        linux,pci-domain = <0x00>;
+                };
+
+                rtc@101000 {
+                        interrupts = <0x0b>;
+                        interrupt-parent = <0x03>;
+                        compatible = "google,goldfish-rtc";
+                        reg = <0x00 0x101000 0x00 0x1000>;
+                };
+
+                virtio_mmio@10008000 {
+                        interrupts = <0x08>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10008000 0x00 0x1000>;
+                };
+
+                virtio_mmio@10005000 {
+                        interrupts = <0x05>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10005000 0x00 0x1000>;
+                };
+
+                virtio_mmio@10002000 {
+                        interrupts = <0x02>;
+                        interrupt-parent = <0x03>;
+                        compatible = "virtio,mmio";
+                        reg = <0x00 0x10002000 0x00 0x1000>;
+                };
+
+                test@100000 {
+                        compatible = "sifive,test1\0sifive,test0\0syscon";
+                        reg = <0x00 0x100000 0x00 0x1000>;
+                        phandle = <0x04>;
+                };
+        };
+};
+```
+这里我们可以看到一些核心的信息：
+1. 核心架构信息：
+  - Model: riscv-virtio,qemu
+  - CPU特性：数量:cpu@0 一个核心， MMU类型： riscv,sv57，ISA扩展集
+  - 地址空间：根节点的#address-cells = <0x02> 和 #size-cells = <0x02> 表示地址和大小均为64位（2个32位单元）。
+2. 内存布局：
+  - 主内存：起始于物理地址0x8000000，大小0x1000000（256MB）。
+  - 保留内存区域：reserved-memory节点下定义了两个保留区域，分别位于0x8004000和0x8000000。通常是OpenSBI占用的空间。
+3. 中断控制器
+  - CLINT(Core Local Interruptor) 位于0x2000000，负责本地中断（定时器和软件中断）。
+  - PLIC(Platform-Level Interrupt Controller) 位于0xc000000，负责外设中断管理。可以看到连接了95个终端源:riscv,ndev = <0x5f>。
+4. 外设信息
+  - 串口：serial@10000000，使用ns16550a兼容驱动，映射在0x10000000。chosen节点也指定了stdout-path在这里。
+  -VirtIO总线：多个virtio_mmio节点，分别映射在不同地址（如0x10001000, 0x10004000等），用于虚拟化设备（磁盘、网络等）。
+  - PCI总线：pci@30000000节点，支持挂载更复杂的PCI设备。
+  - RTC：rtc@101000节点，在断网情况下提供时间。
 
 ## Linux实验测试
 上述都是对整个linux在riscv上启动过程的分析，其中对于系统调用的实现和内核模块的编写是我们实验的重点，下面我们来完成一下实验测试。
@@ -1181,3 +1443,11 @@ hello_module 12288 0 - Live 0xffffffff01796000 (O)
 这项实验是在Risc-V上迁移linux的实验，尽管之前的操作系统实验中我也学到过在Risc-V的架构上从零编写一个操作系统（rCore），这项实验的难度还是比较大，原因首先在于rCore全部是由Rust+汇编以及一小部分的C通过extern "C"引入，代码量小且结构清晰。而Linux部分的代码量太大，实现一个功能所需要的层级文件太多，且由于C的特性一些外部函数的引用位置不清楚，再加上启动过程的许多汇编的代码，导致阅读很困难。其二是对于操作系统启动中的许多操作并不了解，要初始化的各种部分以及对齐和设置的各种空间，造成了理解上的困难。
 
 在之后的学习中我会尝试配合《计算机体系结构》、《Linux Kernel Development》的学习，效果应该会好一些。
+
+参考资料：
+linux源代码：https://github.com/torvalds/linux.git
+Risc-V中文手册：https://github.com/ISRC-CAS/riscv-isa-manual-cn.git
+Linux 内核的编译&集成BusyBox并运用QEMU进行测试：https://zhuanlan.zhihu.com/p/146580665
+opensbi从0到1入门学习：https://blog.csdn.net/weixin_43083491/article/details/148935010
+【Linux内核|系统调用】深度分析系统调用从用户程序到内核的流程：https://kingdix10.github.io/zh-cn/docs/04-kernel/linux-6.6/syscall/syscall/
+qemu dtb的导入导出和自定义修改：https://www.cnblogs.com/lvzh/p/17409978.html
